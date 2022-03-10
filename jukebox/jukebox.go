@@ -1,21 +1,170 @@
 // author: AlexKraak (https://github.com/alexkraak/)
+// author: sentriz (https://github.com/sentriz/)
 
 package jukebox
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"log"
-	"os"
 	"sync"
 	"time"
 
-	"github.com/faiface/beep"
-	"github.com/faiface/beep/flac"
-	"github.com/faiface/beep/mp3"
-	"github.com/faiface/beep/speaker"
-
-	"go.senan.xyz/gonic/db"
+	"go.senan.xyz/gonic/countrw"
+	"go.senan.xyz/gonic/transcode"
 )
+
+type Jukebox struct {
+	transcoder transcode.Transcoder
+	pcmw       io.Writer
+	pcmr       *countrw.CountReader
+	player     Player
+
+	next   chan struct{}
+	cancel chan struct{}
+	quit   chan struct{}
+
+	i       int
+	items   []*PlaylistItem
+	itemsmu sync.RWMutex
+}
+
+func New(transcoder transcode.Transcoder, pf PlayerFunc) (*Jukebox, error) {
+	var j Jukebox
+	j.transcoder = transcoder
+
+	j.cancel = make(chan struct{})
+	j.next = make(chan struct{})
+	j.quit = make(chan struct{})
+
+	pcmr, pcmw := io.Pipe()
+	j.pcmw = pcmw
+	j.pcmr = countrw.NewCountReader(pcmr)
+
+	var err error
+	j.player, err = pf(j.pcmr)
+	if err != nil {
+		return nil, fmt.Errorf("create player: %w", err)
+	}
+
+	return &j, nil
+}
+
+func (j *Jukebox) DecodeStream() {
+	decode := func(ctx context.Context) {
+		defer func() {
+			j.pcmr.Reset()
+		}()
+		item, err := j.Current()
+		if err != nil {
+			j.ClearItems()
+			return
+		}
+
+		profile := transcode.WithSeek(transcode.PCM16le, item.seek)
+		if err := j.transcoder.Transcode(ctx, profile, item.path, j.pcmw); err != nil {
+			log.Printf("decoding item: %v", err)
+		}
+		j.write(func() { j.i++ })
+		j.next <- struct{}{}
+	}
+
+	for {
+		ctx, cancel := context.WithCancel(context.Background())
+		select {
+		case <-j.next:
+			go func() {
+				decode(ctx)
+				cancel()
+			}()
+		case <-j.cancel:
+			cancel()
+		case <-j.quit:
+			cancel()
+			break
+		}
+	}
+}
+
+func (j *Jukebox) Quit() {
+	j.write(func() {
+		j.i = 0
+		j.items = []*PlaylistItem{}
+		j.pcmr.Reset()
+		j.player.Close()
+		close(j.quit)
+	})
+}
+
+func (j *Jukebox) GetItems() []*PlaylistItem {
+	var items []*PlaylistItem
+	j.read(func() {
+		items = append(items, j.items...)
+	})
+	return items
+}
+func (j *Jukebox) SetItems(items []*PlaylistItem) {
+	j.write(func() {
+		j.items = items
+	})
+	j.next <- struct{}{}
+}
+func (j *Jukebox) AppendItems(items []*PlaylistItem) {
+	j.write(func() {
+		j.items = append(j.items, items...)
+	})
+}
+func (j *Jukebox) RemoveItem(i int) {
+	j.write(func() {
+		if !inbounds(len(j.items), i) {
+			return
+		}
+		j.items = append(j.items[:i], j.items[i+1:]...)
+	})
+}
+
+func (j *Jukebox) ClearItems() {
+	j.write(func() {
+		j.i = 0
+		j.items = []*PlaylistItem{}
+		j.player.Reset()
+		j.pcmr.Reset()
+	})
+}
+
+func (j *Jukebox) Pause() { j.player.Pause() }
+func (j *Jukebox) Play()  { j.player.Play() }
+
+var ErrOOB = fmt.Errorf("out of bounds")
+
+func (j *Jukebox) Current() (*PlaylistItem, error) {
+	var item *PlaylistItem
+	var err error
+	j.read(func() {
+		if !inbounds(len(j.items), j.i) {
+			err = ErrOOB
+			return
+		}
+		item = j.items[j.i]
+	})
+	return item, err
+}
+
+func (j *Jukebox) Skip(i int, offsetSecs int) {
+	j.write(func() {
+		if !inbounds(len(j.items), i) {
+			return
+		}
+		j.i = i
+		j.items[i].seek = time.Duration(offsetSecs) * time.Second
+		j.player.Play()
+		j.next <- struct{}{}
+	})
+}
+
+func (j *Jukebox) SetGain(v float64) { j.player.SetVolume(v) }
+func (j *Jukebox) GetGain() float64  { return j.player.Volume() }
 
 type Status struct {
 	CurrentIndex int
@@ -24,182 +173,50 @@ type Status struct {
 	Position     int
 }
 
-type Jukebox struct {
-	playlist []*db.Track
-	index    int
-	playing  bool
-	sr       beep.SampleRate
-	// used to notify the player to re read the members
-	quit    chan struct{}
-	done    chan bool
-	info    *strmInfo
-	speaker chan updateSpeaker
-	sync.Mutex
-}
-
-type strmInfo struct {
-	ctrlStrmr beep.Ctrl
-	strm      beep.StreamSeekCloser
-	format    beep.Format
-}
-
-type updateSpeaker struct {
-	index  int
-	offset int
-}
-
-func New() *Jukebox {
-	return &Jukebox{
-		sr:      beep.SampleRate(48000),
-		speaker: make(chan updateSpeaker, 1),
-		done:    make(chan bool),
-		quit:    make(chan struct{}),
-	}
-}
-
-func (j *Jukebox) Listen() error {
-	if err := speaker.Init(j.sr, j.sr.N(time.Second/2)); err != nil {
-		return fmt.Errorf("initing speaker: %w", err)
-	}
-	for {
-		select {
-		case <-j.quit:
-			return nil
-		case speaker := <-j.speaker:
-			if err := j.doUpdateSpeaker(speaker); err != nil {
-				log.Printf("error in jukebox: %v", err)
-			}
-		}
-	}
-}
-
-func (j *Jukebox) Quit() {
-	j.quit <- struct{}{}
-}
-
-func (j *Jukebox) doUpdateSpeaker(su updateSpeaker) error {
-	j.Lock()
-	defer j.Unlock()
-	if su.index >= len(j.playlist) {
-		j.playing = false
-		speaker.Clear()
-		return nil
-	}
-	j.index = su.index
-	f, err := os.Open(j.playlist[su.index].AbsPath())
-	if err != nil {
-		return err
-	}
-	var streamer beep.Streamer
-	var format beep.Format
-	switch j.playlist[su.index].Ext() {
-	case "mp3":
-		streamer, format, err = mp3.Decode(f)
-	case "flac":
-		streamer, format, err = flac.Decode(f)
-	}
-	if err != nil {
-		return err
-	}
-	j.info = &strmInfo{}
-	j.info.strm = streamer.(beep.StreamSeekCloser)
-	if su.offset != 0 {
-		samples := format.SampleRate.N(time.Second * time.Duration(su.offset))
-		if err := j.info.strm.Seek(samples); err != nil {
-			return err
-		}
-	}
-	j.info.ctrlStrmr.Streamer = beep.Resample(
-		4, format.SampleRate,
-		j.sr, j.info.strm,
-	)
-	j.info.format = format
-	speaker.Play(beep.Seq(&j.info.ctrlStrmr, beep.Callback(func() {
-		j.speaker <- updateSpeaker{index: su.index + 1}
-	})))
-	return nil
-}
-
-func (j *Jukebox) SetTracks(tracks []*db.Track) {
-	j.Lock()
-	defer j.Unlock()
-	j.playlist = tracks
-}
-
-func (j *Jukebox) AddTracks(tracks []*db.Track) {
-	j.Lock()
-	if len(j.playlist) == 0 {
-		j.playlist = tracks
-		j.playing = true
-		j.index = 0
-		j.Unlock()
-		j.speaker <- updateSpeaker{index: 0}
-		return
-	}
-	j.playlist = append(j.playlist, tracks...)
-	j.Unlock()
-}
-
-func (j *Jukebox) RemoveTrack(i int) {
-	j.Lock()
-	defer j.Unlock()
-	if i < 0 || i >= len(j.playlist) {
-		return
-	}
-	j.playlist = append(j.playlist[:i], j.playlist[i+1:]...)
-}
-
-func (j *Jukebox) Skip(i int, offset int) {
-	speaker.Clear()
-	j.Lock()
-	j.index = i
-	j.playing = true
-	j.Unlock()
-	j.speaker <- updateSpeaker{index: j.index, offset: offset}
-}
-
-func (j *Jukebox) ClearTracks() {
-	speaker.Clear()
-	j.Lock()
-	defer j.Unlock()
-	j.playing = false
-	j.playlist = []*db.Track{}
-}
-
-func (j *Jukebox) Stop() {
-	j.Lock()
-	defer j.Unlock()
-	if j.info != nil {
-		j.playing = false
-		j.info.ctrlStrmr.Paused = true
-	}
-}
-
-func (j *Jukebox) Start() {
-	if j.info != nil {
-		j.playing = true
-		j.info.ctrlStrmr.Paused = false
-	}
-}
-
 func (j *Jukebox) GetStatus() Status {
-	j.Lock()
-	defer j.Unlock()
-	position := 0
-	if j.info != nil {
-		length := j.info.format.SampleRate.D(j.info.strm.Position())
-		position = int(length.Round(time.Millisecond).Seconds())
-	}
-	return Status{
-		CurrentIndex: j.index,
-		Playing:      j.playing,
-		Gain:         0.9,
-		Position:     position,
-	}
+	var status Status
+	j.read(func() {
+		status.CurrentIndex = j.i
+		status.Playing = j.player.IsPlaying()
+		status.Gain = j.player.Volume()
+
+		if !inbounds(len(j.items), j.i) {
+			return
+		}
+
+		item := j.items[j.i]
+		playedBytes := j.pcmr.Count() - uint64(j.player.UnplayedBufferSize())
+		playedSecs := playedBytes / (BitRate / 8)
+		seekedSecs := item.seek.Seconds()
+		status.Position = int(playedSecs) + int(seekedSecs)
+	})
+	return status
 }
 
-func (j *Jukebox) GetTracks() []*db.Track {
-	j.Lock()
-	defer j.Unlock()
-	return j.playlist
+func (j *Jukebox) read(f func()) {
+	j.itemsmu.RLock()
+	defer j.itemsmu.RUnlock()
+	f()
+}
+func (j *Jukebox) write(f func()) {
+	j.itemsmu.Lock()
+	defer j.itemsmu.Unlock()
+	f()
+}
+
+func inbounds(length, i int) bool {
+	return length > 0 && i >= 0 && i < length
+}
+
+type PlaylistItem struct {
+	id   int
+	path string
+	seek time.Duration
+}
+
+func (p *PlaylistItem) ID() int      { return p.id }
+func (p *PlaylistItem) Path() string { return p.path }
+
+func NewPlaylistItem(id int, path string) *PlaylistItem {
+	return &PlaylistItem{id: id, path: path}
 }
